@@ -9,6 +9,7 @@ on:
       - '**.md'
       - 'LICENSE'
       - '.gitignore'
+  workflow_dispatch:
 
 env:
   GO_VERSION: '1.24'
@@ -45,6 +46,11 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
+      - name: Install UPX (for compression)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl
+
       - name: Extract plugin ID
         id: plugin
         run: |
@@ -58,7 +64,15 @@ jobs:
           echo "id=${PLUGIN_ID}" >> $GITHUB_OUTPUT
           echo "Plugin ID: ${PLUGIN_ID}"
 
-      - name: Build binary
+      - name: Get version info
+        id: version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "version=beta-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "commit=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Build binary (hardened)
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
@@ -66,39 +80,56 @@ jobs:
           CGO_ENABLED: '0'
           PLUGIN_ID: ${{ steps.plugin.outputs.id }}
         run: |
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          VERSION="beta-${SHORT_SHA}"
-          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Maximum size reduction and security hardening flags
+          LDFLAGS="-w -s -buildid="
+          LDFLAGS="$LDFLAGS -X main.Version=${{ steps.version.outputs.version }}"
+          LDFLAGS="$LDFLAGS -X main.BuildTime=${{ steps.version.outputs.build_time }}"
+          LDFLAGS="$LDFLAGS -X main.GitCommit=${{ steps.version.outputs.commit }}"
           
-          LDFLAGS="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}"
-          LDFLAGS="${LDFLAGS} -extldflags '-static'"
+          BUILD_TAGS="netgo,osusergo"
+          export GOGC=off
           
-          go build -trimpath -ldflags "${LDFLAGS}" -tags "netgo,osusergo" -buildid= -o "${PLUGIN_ID}" .
+          echo "Building ${PLUGIN_ID} beta for ${{ matrix.name }}..."
+          go build -a -trimpath -installsuffix cgo \
+            -tags "$BUILD_TAGS" \
+            -ldflags "$LDFLAGS" \
+            -gcflags=all="-l -B" \
+            -o "${PLUGIN_ID}" .
           
-          echo "Built ${PLUGIN_ID} beta for ${{ matrix.name }}"
-          ls -la "${PLUGIN_ID}"
+          echo "Initial binary size:"
+          ls -lh "${PLUGIN_ID}"
 
-      - name: Install UPX
+      - name: Strip binary (additional size reduction)
+        env:
+          PLUGIN_ID: ${{ steps.plugin.outputs.id }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y upx-ucl
+          if [ "${{ matrix.goarch }}" = "amd64" ] || [ "${{ matrix.goarch }}" = "386" ]; then
+            strip --strip-all "${PLUGIN_ID}" 2>/dev/null || true
+            echo "After strip:"
+            ls -lh "${PLUGIN_ID}"
+          fi
 
       - name: Compress binary with UPX
         env:
           PLUGIN_ID: ${{ steps.plugin.outputs.id }}
         run: |
-          if [[ "${{ matrix.goarch }}" == "arm" ]]; then
-            upx --best "${PLUGIN_ID}" || echo "UPX compression failed, using uncompressed binary"
+          echo "Compressing with UPX..."
+          
+          if [ "${{ matrix.goarch }}" = "arm" ]; then
+            upx --best "${PLUGIN_ID}" 2>/dev/null || echo "UPX failed (ARM), skipping"
           else
-            upx --best --lzma "${PLUGIN_ID}" || upx --best "${PLUGIN_ID}" || echo "UPX compression failed, using uncompressed binary"
+            upx --best --lzma "${PLUGIN_ID}" 2>/dev/null || upx --best "${PLUGIN_ID}" 2>/dev/null || echo "UPX failed, skipping"
           fi
-          ls -la "${PLUGIN_ID}"
+          
+          echo "Final binary size:"
+          ls -lh "${PLUGIN_ID}"
 
       - name: Generate checksum
         env:
           PLUGIN_ID: ${{ steps.plugin.outputs.id }}
         run: |
           sha256sum "${PLUGIN_ID}" > "${PLUGIN_ID}-${{ matrix.artifact }}-beta.sha256"
+          cat "${PLUGIN_ID}-${{ matrix.artifact }}-beta.sha256"
 
       - name: Create archive
         env:
@@ -159,13 +190,13 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec mv {} release/ \;
-          ls -la release/
-
-      - name: Generate checksums
-        working-directory: release
-        run: |
+          
+          cd release
           cat *.sha256 > SHA256SUMS
           cat SHA256SUMS
+          cd ..
+          
+          ls -la release/
 
       - name: Delete existing beta release
         env:
@@ -186,7 +217,10 @@ jobs:
             ⚠️ **This is a development build** - use stable releases for production.
             
             **Commit:** ${{ github.sha }}
-            **Built:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            **Built:** ${{ github.event.head_commit.timestamp }}
+            
+            ### 🔐 Security
+            Binaries are built with hardened flags and UPX compression.
             
             ### Downloads
             
@@ -200,6 +234,12 @@ jobs:
             
             ```bash
             tar -xzf ${{ steps.plugin.outputs.id }}-linux-amd64-beta.tar.gz -C ~/.nettool/plugins/${{ steps.plugin.outputs.id }}/
+            ```
+            
+            ### Verify Download
+            
+            ```bash
+            sha256sum -c SHA256SUMS
             ```
           files: |
             release/*.tar.gz

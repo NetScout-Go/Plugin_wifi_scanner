@@ -1,0 +1,208 @@
+name: Build Beta Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+env:
+  GO_VERSION: '1.24'
+
+jobs:
+  build:
+    name: Build Beta ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            goos: linux
+            goarch: amd64
+            artifact: linux-amd64
+          - name: Linux x32
+            goos: linux
+            goarch: '386'
+            artifact: linux-386
+          - name: Linux ARM6 (Pi Zero)
+            goos: linux
+            goarch: arm
+            goarm: '6'
+            artifact: linux-arm6
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Extract plugin ID
+        id: plugin
+        run: |
+          if [ -f "plugin.json" ]; then
+            PLUGIN_ID=$(jq -r '.id // empty' plugin.json 2>/dev/null || echo "")
+          fi
+          if [ -z "$PLUGIN_ID" ]; then
+            REPO_NAME="${{ github.event.repository.name }}"
+            PLUGIN_ID="${REPO_NAME#Plugin_}"
+          fi
+          echo "id=${PLUGIN_ID}" >> $GITHUB_OUTPUT
+          echo "Plugin ID: ${PLUGIN_ID}"
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+          PLUGIN_ID: ${{ steps.plugin.outputs.id }}
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          VERSION="beta-${SHORT_SHA}"
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          LDFLAGS="-w -s -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}"
+          LDFLAGS="${LDFLAGS} -extldflags '-static'"
+          
+          go build -trimpath -ldflags "${LDFLAGS}" -tags "netgo,osusergo" -buildid= -o "${PLUGIN_ID}" .
+          
+          echo "Built ${PLUGIN_ID} beta for ${{ matrix.name }}"
+          ls -la "${PLUGIN_ID}"
+
+      - name: Install UPX
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl
+
+      - name: Compress binary with UPX
+        env:
+          PLUGIN_ID: ${{ steps.plugin.outputs.id }}
+        run: |
+          if [[ "${{ matrix.goarch }}" == "arm" ]]; then
+            upx --best "${PLUGIN_ID}" || echo "UPX compression failed, using uncompressed binary"
+          else
+            upx --best --lzma "${PLUGIN_ID}" || upx --best "${PLUGIN_ID}" || echo "UPX compression failed, using uncompressed binary"
+          fi
+          ls -la "${PLUGIN_ID}"
+
+      - name: Generate checksum
+        env:
+          PLUGIN_ID: ${{ steps.plugin.outputs.id }}
+        run: |
+          sha256sum "${PLUGIN_ID}" > "${PLUGIN_ID}-${{ matrix.artifact }}-beta.sha256"
+
+      - name: Create archive
+        env:
+          PLUGIN_ID: ${{ steps.plugin.outputs.id }}
+        run: |
+          ARCHIVE_NAME="${PLUGIN_ID}-${{ matrix.artifact }}-beta.tar.gz"
+          
+          FILES_TO_ARCHIVE="${PLUGIN_ID}"
+          [ -f "plugin.json" ] && FILES_TO_ARCHIVE="${FILES_TO_ARCHIVE} plugin.json"
+          [ -f "data.json" ] && FILES_TO_ARCHIVE="${FILES_TO_ARCHIVE} data.json"
+          [ -d "static" ] && FILES_TO_ARCHIVE="${FILES_TO_ARCHIVE} static"
+          
+          tar -czvf "${ARCHIVE_NAME}" ${FILES_TO_ARCHIVE}
+          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-beta-${{ matrix.artifact }}
+          path: |
+            ${{ env.archive_name }}
+            ${{ steps.plugin.outputs.id }}-${{ matrix.artifact }}-beta.sha256
+
+  release:
+    name: Update Beta Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract plugin info
+        id: plugin
+        run: |
+          if [ -f "plugin.json" ]; then
+            PLUGIN_ID=$(jq -r '.id // empty' plugin.json 2>/dev/null || echo "")
+            PLUGIN_NAME=$(jq -r '.name // empty' plugin.json 2>/dev/null || echo "")
+          fi
+          if [ -z "$PLUGIN_ID" ]; then
+            REPO_NAME="${{ github.event.repository.name }}"
+            PLUGIN_ID="${REPO_NAME#Plugin_}"
+          fi
+          if [ -z "$PLUGIN_NAME" ]; then
+            PLUGIN_NAME="${PLUGIN_ID}"
+          fi
+          echo "id=${PLUGIN_ID}" >> $GITHUB_OUTPUT
+          echo "name=${PLUGIN_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec mv {} release/ \;
+          ls -la release/
+
+      - name: Generate checksums
+        working-directory: release
+        run: |
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Delete existing beta release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Delete existing beta tag and release if they exist
+          gh release delete beta --yes 2>/dev/null || true
+          git push origin :refs/tags/beta 2>/dev/null || true
+
+      - name: Create Beta Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta
+          name: "${{ steps.plugin.outputs.name }} Beta"
+          body: |
+            ## ${{ steps.plugin.outputs.name }} Beta Build
+            
+            ⚠️ **This is a development build** - use stable releases for production.
+            
+            **Commit:** ${{ github.sha }}
+            **Built:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            
+            ### Downloads
+            
+            | Platform | File |
+            |----------|------|
+            | Linux x64 | `${{ steps.plugin.outputs.id }}-linux-amd64-beta.tar.gz` |
+            | Linux x32 | `${{ steps.plugin.outputs.id }}-linux-386-beta.tar.gz` |
+            | Linux ARM6 | `${{ steps.plugin.outputs.id }}-linux-arm6-beta.tar.gz` |
+            
+            ### Installation
+            
+            ```bash
+            tar -xzf ${{ steps.plugin.outputs.id }}-linux-amd64-beta.tar.gz -C ~/.nettool/plugins/${{ steps.plugin.outputs.id }}/
+            ```
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS
+          draft: false
+          prerelease: true
